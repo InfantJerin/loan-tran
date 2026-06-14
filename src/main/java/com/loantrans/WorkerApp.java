@@ -3,6 +3,10 @@ package com.loantrans;
 import com.loantrans.ctl.MockedLedgerActivitiesImpl;
 import com.loantrans.di.DocumentIntelligenceWorkflowImpl;
 import com.loantrans.dts.DealTermSetupWorkflowImpl;
+import com.loantrans.egs.EgsActivitiesImpl;
+import com.loantrans.egs.EgsDispatcher;
+import com.loantrans.egs.EventBus;
+import com.loantrans.egs.InMemoryEventBus;
 import com.loantrans.servicing.ServicingSetupWorkflowImpl;
 import com.loantrans.tlm.TradeLifecycleWorkflowImpl;
 import io.temporal.client.WorkflowClient;
@@ -20,6 +24,8 @@ public class WorkerApp {
         WorkflowClient client = WorkflowClient.newInstance(service);
         WorkerFactory factory = WorkerFactory.newInstance(client);
 
+        EventBus bus = new InMemoryEventBus();
+
         Worker dts = factory.newWorker(TaskQueues.DTS_TQ);
         dts.registerWorkflowImplementationTypes(DealTermSetupWorkflowImpl.class);
 
@@ -35,9 +41,15 @@ public class WorkerApp {
         Worker ctl = factory.newWorker(TaskQueues.CTL_TQ);
         ctl.registerActivitiesImplementations(new MockedLedgerActivitiesImpl());
 
+        Worker egs = factory.newWorker(TaskQueues.EGS_TQ);
+        egs.registerActivitiesImplementations(new EgsActivitiesImpl(bus));
+
         factory.start();
-        log.info("Workers started on queues: {}, {}, {}, {}, {}",
-                TaskQueues.DTS_TQ, TaskQueues.SERVICING_TQ, TaskQueues.TLM_TQ, TaskQueues.DI_TQ, TaskQueues.CTL_TQ);
+        new EgsDispatcher(client, bus).start();
+
+        log.info("Workers started on queues: {}, {}, {}, {}, {}, {}",
+                TaskQueues.DTS_TQ, TaskQueues.SERVICING_TQ, TaskQueues.TLM_TQ,
+                TaskQueues.DI_TQ, TaskQueues.CTL_TQ, TaskQueues.EGS_TQ);
         log.info("Ctrl+C to stop.");
     }
 }

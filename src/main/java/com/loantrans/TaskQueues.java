@@ -6,6 +6,7 @@ public final class TaskQueues {
     public static final String SERVICING_TQ = "servicing-tq";
     public static final String TLM_TQ = "tlm-tq";
     public static final String CTL_TQ = "ctl-tq";
+    public static final String EGS_TQ = "egs-tq";
 
     private TaskQueues() {}
 }

@@ -2,14 +2,12 @@ package com.loantrans.dts;
 
 import com.loantrans.TaskQueues;
 import com.loantrans.ctl.LedgerActivities;
+import com.loantrans.egs.EgsActivities;
 import com.loantrans.model.DealTerms;
+import com.loantrans.model.DealTermsCommitted;
 import com.loantrans.model.LedgerAck;
 import com.loantrans.model.ProductSetupEvent;
-import com.loantrans.servicing.ServicingSetupWorkflow;
 import io.temporal.activity.ActivityOptions;
-import io.temporal.api.enums.v1.ParentClosePolicy;
-import io.temporal.workflow.Async;
-import io.temporal.workflow.ChildWorkflowOptions;
 import io.temporal.workflow.Workflow;
 import org.slf4j.Logger;
 
@@ -22,6 +20,13 @@ public class DealTermSetupWorkflowImpl implements DealTermSetupWorkflow {
             LedgerActivities.class,
             ActivityOptions.newBuilder()
                     .setTaskQueue(TaskQueues.CTL_TQ)
+                    .setStartToCloseTimeout(Duration.ofSeconds(10))
+                    .build());
+
+    private final EgsActivities egs = Workflow.newActivityStub(
+            EgsActivities.class,
+            ActivityOptions.newBuilder()
+                    .setTaskQueue(TaskQueues.EGS_TQ)
                     .setStartToCloseTimeout(Duration.ofSeconds(10))
                     .build());
 
@@ -39,16 +44,8 @@ public class DealTermSetupWorkflowImpl implements DealTermSetupWorkflow {
         LedgerAck ack = ctl.writeDealTerms(terms);
         log.info("[DTS] terms committed to ledger {}", ack.ledgerId());
 
-        ChildWorkflowOptions servicingOptions = ChildWorkflowOptions.newBuilder()
-                .setTaskQueue(TaskQueues.SERVICING_TQ)
-                .setWorkflowId("servicing-setup-" + event.dealId())
-                .setParentClosePolicy(ParentClosePolicy.PARENT_CLOSE_POLICY_ABANDON)
-                .build();
-        ServicingSetupWorkflow servicing = Workflow.newChildWorkflowStub(
-                ServicingSetupWorkflow.class, servicingOptions);
-        Async.procedure(servicing::onTermsCommitted, terms);
-        Workflow.getWorkflowExecution(servicing).get();
-        log.info("[DTS] handed off to Servicing");
+        egs.publish(new DealTermsCommitted(terms));
+        log.info("[DTS] DealTermsCommitted published — DTS done");
 
         return ack.ledgerId();
     }
