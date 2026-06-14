@@ -1,5 +1,6 @@
 package com.loantrans.ctl;
 
+import com.loantrans.model.Allocations;
 import com.loantrans.model.DealTerms;
 import com.loantrans.model.LedgerAck;
 import org.slf4j.Logger;
@@ -21,6 +22,12 @@ public class MockedLedgerActivitiesImpl implements LedgerActivities {
     public LedgerAck bookTrade(String tradeId, String dealId, double notional) {
         log.info("[CTL mock] bookTrade trade={} deal={} notional={}", tradeId, dealId, notional);
         return new LedgerAck("ledger-" + UUID.randomUUID(), dealId, System.currentTimeMillis());
+    }
+
+    @Override
+    public LedgerAck writeAllocations(String tradeId, Allocations allocations) {
+        log.info("[CTL mock] writeAllocations trade={} lines={}", tradeId, allocations.lines().size());
+        return new LedgerAck("ledger-" + UUID.randomUUID(), tradeId, System.currentTimeMillis());
     }
 
     @Override

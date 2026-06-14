@@ -13,7 +13,7 @@ Model the loan platform as a set of controllers, each with its own Temporal task
 
 | Component | Kind | Task queue | Notes |
 |---|---|---|---|
-| **EGS** — External Gateway Service | Ingress / egress + event router | `egs-tq` | Receives external events, and exposes a `publish` activity that controllers call to emit domain events. The activity owns the routing table and starts the appropriate downstream workflow directly via `WorkflowClient.start` (no separate bus or dispatcher thread). |
+| **EGS** — External Gateway Service | Ingress / egress + event router + vendor adapters | `egs-tq` | Receives external events; exposes `publish(DomainEvent)` (internal routing → starts downstream workflows via `WorkflowClient.start`) and `publishToClearPar(...)` (outbound ClearPar EMS publish). Also runs a `ClearParInboundConsumer` thread that reads ClearPar's inbound EMS topic and signals running TLM workflows. ClearPar lives modularly under `com.loantrans.egs.clearpar`. |
 | **DTS** — Deal Term Service controller | Workflow worker | `dts-tq` | Owns deal-term setup. Writes terms to the ledger via CTL. |
 | **DI** — Document Intelligence controller | Workflow worker | `di-tq` | Placement in the flows is TBD — see open questions. |
 | **Servicing** controller | Workflow worker | `servicing-tq` | Picks up post-setup and post-settlement work. |
@@ -87,39 +87,69 @@ sequenceDiagram
     Servicing->>Servicing: post-setup tasks
 ```
 
-## Flow B — Book trade
+## Flow B — Book trade (orchestration inside TLM, choreography out)
 
-Trigger: a `BookTrade` event originates from the trading-desk side, arrives at EGS, and is routed to the TLM event log.
+Trigger: a `BookTrade` event arrives at EGS (today, fired directly by `BookTradeStarter`).
 
-Durable execution: a `TradeLifecycleWorkflow` on `tlm-tq` that owns the whole booking → allocation → settlement lifecycle. It writes to CTL at two points (booking, settled) and round-trips through EGS to ClearPar for allocations. On settlement, it hands off to Servicing.
+**Within TLM:** orchestration — one `TradeLifecycleWorkflow` on `tlm-tq` owns the whole booking → upload → allocations → settlement-coordination → settled lifecycle. It calls `CTL` at three points (book, write-allocations, settle), and uses `EgsActivities.publishToClearPar` for every outbound message. All inbound responses arrive as **signals**, with `Workflow.await` checkpoints between them.
+
+**EGS as bidirectional ClearPar bridge (mono-EGS shape):**
+- *Outbound* — `publishToClearPar` is an EGS activity on `egs-tq`; the impl writes to the mocked EMS outbound topic.
+- *Inbound* — a `ClearParInboundConsumer` thread inside EGS reads the EMS inbound topic, looks up the running workflow by id (`tlm-trade-<tradeId>`), and signals it. No HTTP webhook — all message-based per ClearPar's actual transport.
+- ClearPar lives in `com.loantrans.egs.clearpar` — modular under EGS, not a separate component. Split into its own task queue when slow ClearPar work starts blocking unrelated EGS work; split into its own service only when org-shape forces it.
+
+**Between TLM and Servicing:** choreography — same pattern as DTS→Servicing. TLM publishes a `TradeSettled` domain event; EGS routes it to `ServicingPostSettlementWorkflow`. TLM does not import Servicing.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Desk as Trading desk
-    participant EGS
-    participant TLM as TLM workflow (tlm-tq)
-    participant CTL as CTL workflow (ctl-tq, mocked)
-    participant ClearPar
+    participant EGSin as EGS ingress
+    participant TLM as TradeLifecycleWorkflow (tlm-tq)
+    participant CTL as CTL activity (ctl-tq, mocked)
+    participant EGSpub as EGS publish (egs-tq)
+    participant EMS as ClearPar EMS (mocked)
+    participant CPmock as ClearPar (mocked simulator)
+    participant Inbox as EGS inbound consumer
     participant Servicing as Servicing workflow (servicing-tq)
 
-    Desk->>EGS: BookTrade event
-    EGS->>TLM: StartWorkflow(TradeLifecycle, trade)
+    Desk->>EGSin: BookTrade event
+    EGSin->>TLM: StartWorkflow id=tlm-trade-T1
 
-    TLM->>CTL: BookTrade(activity) — record booking on ledger
-    CTL-->>TLM: ledger ack (mocked)
+    TLM->>CTL: bookTrade
+    CTL-->>TLM: ack
 
-    TLM->>EGS: PublishToClearPar(trade)
-    EGS->>ClearPar: trade message
-    ClearPar-->>EGS: allocations
-    EGS-->>TLM: signal: AllocationsReceived
+    TLM->>EGSpub: publishToClearPar(UploadTrade)
+    EGSpub->>EMS: outbound queue
+    EMS->>CPmock: deliver UploadTrade
+    TLM->>TLM: Workflow.await(confirmation)
 
-    TLM->>TLM: apply allocations
-    TLM->>CTL: SettleTrade(activity) — write "trade settled"
-    CTL-->>TLM: ledger ack (mocked)
+    CPmock->>EMS: inbound queue: TradeConfirmation
+    EMS->>Inbox: deliver
+    Inbox->>TLM: signal onTradeConfirmation
+    TLM->>TLM: Workflow.await(allocations)
 
-    TLM-->>EGS: TradeSettled event
-    EGS->>Servicing: StartWorkflow(ServicingPostSettlement, trade)
+    CPmock->>EMS: inbound queue: Allocations
+    EMS->>Inbox: deliver
+    Inbox->>TLM: signal onAllocations
+
+    TLM->>CTL: writeAllocations
+    CTL-->>TLM: ack
+
+    TLM->>EGSpub: publishToClearPar(SettlementCoordination)
+    EGSpub->>EMS: outbound queue
+    EMS->>CPmock: deliver SettlementCoordination
+    TLM->>TLM: Workflow.await(settled)
+
+    CPmock->>EMS: inbound queue: TradeSettledNotice
+    EMS->>Inbox: deliver
+    Inbox->>TLM: signal onTradeSettled
+
+    TLM->>CTL: settleTrade
+    CTL-->>TLM: ack
+
+    TLM->>EGSpub: publish TradeSettled (domain event)
+    EGSpub->>Servicing: WorkflowClient.start (post-settlement)
 ```
 
 ## Why each controller gets its own task queue
@@ -139,6 +169,8 @@ The CTL worker registers the same activity signatures it will have in production
 - **EGS is medium-weight.** Owns the inter-domain event → workflow-start routing table; does not run the step-by-step business saga inside any controller. That resolves the earlier "thin vs. fat EGS" question.
 - **Ledger writes are activities, not events.** CTL is part of each controller's saga (atomic with the state transition, idempotent, replay-safe), so it stays an activity call. Wrapping CTL writes as events would lose compensation guarantees.
 - **Domain events are published via a Temporal activity that directly starts the downstream workflow — no separate event bus at this stage.** Temporal task queues are *worker routing* (one task → one worker), not pub-sub, so the platform itself doesn't give us a bus. An in-memory bus between a publish activity and a separate dispatcher thread is *less* durable than a direct call: Temporal retries failed activities until they succeed, but an in-memory queue is lost on JVM restart. The decoupling we wanted (publisher doesn't import consumer) comes from the *dispatcher pattern* — one component owning the routing table — not from the queue. So the seam is `EgsActivities.publish` and the routing table inside its impl; the impl directly calls `WorkflowClient.start(...)` on the downstream workflow. Reach for a real bus (Kafka, NATS, transactional outbox) only when one of these starts to matter: fan-out to consumers we don't own, replayable event history, cross-cluster federation, or an audit log queryable independently of Temporal.
+- **ClearPar lives inside EGS (mono-EGS shape), not as a separate component.** EGS is defined as the gateway for all external I/O, so vendor adapters belong there. Code is modular by vendor (`com.loantrans.egs.clearpar`); runtime is one process, one `egs-tq`. Move the vendor to its own task queue when slow vendor calls start blocking unrelated EGS work; move it to its own service only when on-call, release cadence, or compliance scope diverges enough that the EGS team can't ship without coordinating with a vendor-specific team.
+- **Inbound from ClearPar uses signals; the workflow id is the correlation key.** ClearPar communication is fully asynchronous and message-based (no HTTP). Outbound activities publish to an EMS topic and complete. Inbound responses arrive via a separate consumer thread that addresses the specific running workflow by id (`tlm-trade-<tradeId>`) and signals it. `Workflow.await` makes the wait durable: the worker can die for hours and the workflow resumes at the same `await` once the signal arrives. Signal handlers must be idempotent because EMS delivery is at-least-once — the standard discipline for any message-driven system. `signalWithStart` covers the race where a callback arrives before the workflow has been started.
 
 ## Open questions
 
